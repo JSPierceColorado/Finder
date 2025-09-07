@@ -1,7 +1,7 @@
 import os
 import requests
 import pandas as pd
-from alpaca.tradeapi import REST
+from alpaca_trade_api import REST
 
 # --- ENVIRONMENT VARIABLES ---
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
