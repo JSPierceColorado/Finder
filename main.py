@@ -2,35 +2,20 @@
 """
 Alpaca + Polygon Screener Buyer (5% swing entries)
 
-Flow:
-  1) Auth to Alpaca (prefers APCA_* env vars) and sanity-check account.
-  2) Pull active, tradable US equities from Alpaca (liquidity/practicality filters).
-  3) For each candidate, fetch Polygon data and apply screen:
-       - TECHNICALS (priority for 5% swings):
-           * Close > SMA20 and Close > SMA50
-           * RSI(14) in [45, 60]
-           * MACD line > signal (bullish)
-           * Within 10% of 52-week high
-           * Relative Volume >= 1.5 (yesterday vs 30D avg)
-       - FUNDAMENTALS (light sanity):
-           * EPS YoY >= 5%
-           * Revenue YoY >= 5%
-           * ROE >= 15%
-           * Debt/Equity <= 1.0
-           * PEG <= 2.0 (if available)
-     (Fundamentals are robust to missing fields; we only pass if available fields meet thresholds.)
-  4) If a ticker passes, submit a MARKET BUY with notional = 5% of current buying power.
-
-Notes:
-  - No sell logic here; your separate bot handles exits.
-  - Keeps logs concise and clear for observability.
+Enhancements:
+  - UTC fix: use datetime.now(timezone.utc)
+  - Detailed logging for each skip reason (price, liquidity, technicals, fundamentals)
+  - End-of-run summary histogram of skip reasons
+  - Periodic progress logs (LOG_PROGRESS_EVERY, default 25)
+  - Optional verbose logging (DEBUG_VERBOSE=1) to print every symbol decision
 """
 
 import os
 import sys
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List, Optional
+from collections import Counter
+from datetime import datetime, timedelta, timezone  # UTC fix here
+from typing import Dict, Any, List, Optional, Tuple
 
 import requests
 import pandas as pd
@@ -46,16 +31,23 @@ ALPACA_API_KEY    = get_env_str("ALPACA_API_KEY") or get_env_str("APCA_API_KEY_I
 ALPACA_SECRET_KEY = get_env_str("ALPACA_SECRET_KEY") or get_env_str("APCA_API_SECRET_KEY")
 APCA_API_BASE_URL = get_env_str("APCA_API_BASE_URL")  # prefer this, like your other bots
 if not APCA_API_BASE_URL:
-    # Fallback if not provided (kept for portability)
     mode = get_env_str("ALPACA_MODE", "paper").lower()
     APCA_API_BASE_URL = "https://paper-api.alpaca.markets" if mode == "paper" else "https://api.alpaca.markets"
 
 POLYGON_API_KEY   = get_env_str("POLYGON_API_KEY")
 POLYGON_BASE      = "https://api.polygon.io"
 
+# Logging controls
+DEBUG_VERBOSE      = get_env_str("DEBUG_VERBOSE", "0") in ("1", "true", "True", "YES", "yes")
+LOG_PROGRESS_EVERY = int(get_env_str("LOG_PROGRESS_EVERY", "25"))
+
 def log(msg: str):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
     print(f"[buy-screener] {now} | {msg}", flush=True)
+
+def vlog(msg: str):
+    if DEBUG_VERBOSE:
+        log(msg)
 
 if not (ALPACA_API_KEY and ALPACA_SECRET_KEY):
     log("❌ Missing ALPACA_API_KEY/APCA_API_KEY_ID or ALPACA_SECRET_KEY/APCA_API_SECRET_KEY")
@@ -79,25 +71,21 @@ except Exception as e:
 # -----------------------------
 # Parameters
 # -----------------------------
-# Universe control
-MAX_TICKERS_TO_CHECK = int(get_env_str("MAX_TICKERS_TO_CHECK", "200"))  # cap API calls
-MIN_PRICE = float(get_env_str("MIN_PRICE", "3.0"))                      # avoid penny stocks
-MIN_AVG_DOLLAR_VOL = float(get_env_str("MIN_AVG_DOLLAR_VOL", "5_000_000"))  # 30D avg $-volume
+MAX_TICKERS_TO_CHECK   = int(get_env_str("MAX_TICKERS_TO_CHECK", "200"))
+MIN_PRICE              = float(get_env_str("MIN_PRICE", "3.0"))
+MIN_AVG_DOLLAR_VOL     = float(get_env_str("MIN_AVG_DOLLAR_VOL", "5_000_000"))
 
-# Screener thresholds (tuned for ~5% swing targets)
-RSI_MIN, RSI_MAX = 45.0, 60.0
-REL_VOL_MIN = 1.5       # yesterday vs 30D avg
-WITHIN_HI_PCT = 0.10    # within 10% of 52w high
+RSI_MIN, RSI_MAX       = 45.0, 60.0
+REL_VOL_MIN            = 1.5        # yesterday vs 30D avg
+WITHIN_HI_PCT          = 0.10       # within 10% of 52w high
 
-# Fundamentals (light)
-EPS_GROWTH_MIN = 0.05
-REV_GROWTH_MIN = 0.05
-ROE_MIN = 0.15
-DE_MIN, PEG_MAX = 1.0, 2.0
+EPS_GROWTH_MIN         = 0.05
+REV_GROWTH_MIN         = 0.05
+ROE_MIN                = 0.15
+DE_MIN, PEG_MAX        = 1.0, 2.0
 
-# Purchase sizing
-BUY_FRACTION_OF_BP = float(get_env_str("BUY_FRACTION_OF_BP", "0.05"))  # 5% of buying power per signal
-TIME_IN_FORCE = get_env_str("TIME_IN_FORCE", "day")
+BUY_FRACTION_OF_BP     = float(get_env_str("BUY_FRACTION_OF_BP", "0.05"))
+TIME_IN_FORCE          = get_env_str("TIME_IN_FORCE", "day")
 
 # -----------------------------
 # Helpers: Indicators
@@ -141,7 +129,8 @@ def poly_get(url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 def fetch_daily_ohlcv(ticker: str, days: int = 260) -> Optional[pd.DataFrame]:
-    end = datetime.utcnow().date()
+    # UTC FIX: was datetime.utcnow().date(); now timezone-aware UTC
+    end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=int(days * 1.6))  # buffer for weekends/holidays
     url = f"{POLYGON_BASE}/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
     j = poly_get(url, {"adjusted": "true", "limit": 5000})
@@ -168,24 +157,16 @@ def fetch_fundamentals_latest(ticker: str) -> Dict[str, Optional[float]]:
     fin = j["results"][0]
     f = fin.get("financials", {}) or {}
 
-    # attempt common field names
-    # EPS & Revenue YoY growth
     out["eps_yoy"] = (f.get("epsGrowth", {}) or {}).get("value")
     out["rev_yoy"] = (f.get("revenueGrowth", {}) or {}).get("value")
-
-    # Profitability
-    out["roe"] = (f.get("roe", {}) or {}).get("value")
-
-    # Leverage
-    out["de"] = (f.get("debtToEquity", {}) or {}).get("value")
-
-    # Valuation
-    out["peg"] = (f.get("pegRatio", {}) or {}).get("value")
+    out["roe"]     = (f.get("roe", {}) or {}).get("value")
+    out["de"]      = (f.get("debtToEquity", {}) or {}).get("value")
+    out["peg"]     = (f.get("pegRatio", {}) or {}).get("value")
 
     return out
 
 # -----------------------------
-# Screen logic
+# Screen logic (with reasons)
 # -----------------------------
 def within_pct_of_high(series: pd.Series, pct: float) -> bool:
     if series.empty:
@@ -210,71 +191,68 @@ def avg_dollar_volume_30d(df: pd.DataFrame) -> Optional[float]:
     vol = df["volume"].iloc[-31:-1]
     return float((px * vol).mean())
 
-def technicals_pass(df: pd.DataFrame) -> bool:
+def technicals_pass(df: pd.DataFrame) -> Tuple[bool, str]:
     closes = df["close"]
     if closes.isna().any() or len(closes) < 50:
-        return False
+        return False, "technical:data_insufficient(<50 bars or NaNs)"
 
     sma20 = sma(closes, 20).iloc[-1]
     sma50 = sma(closes, 50).iloc[-1]
     close = closes.iloc[-1]
     if not (close > sma20 and close > sma50):
-        return False
+        return False, f"technical:below_sma(close={close:.2f},sma20={sma20:.2f},sma50={sma50:.2f})"
 
     rsi_now = rsi(closes, 14).iloc[-1]
     if not (RSI_MIN <= rsi_now <= RSI_MAX):
-        return False
+        return False, f"technical:rsi_out_of_band(rsi14={rsi_now:.2f},range={RSI_MIN}-{RSI_MAX})"
 
     macd_line, macd_sig, _ = macd(closes)
     if not (macd_line.iloc[-1] > macd_sig.iloc[-1]):
-        return False
+        return False, f"technical:macd_not_bullish(line={macd_line.iloc[-1]:.4f},sig={macd_sig.iloc[-1]:.4f})"
 
     if not within_pct_of_high(closes.tail(252), WITHIN_HI_PCT):
-        return False
+        return False, "technical:not_within_10pct_52w_high"
 
     rv = rel_volume_yday_vs_30d(df)
     if rv is None or rv < REL_VOL_MIN:
-        return False
+        return False, f"technical:relvol_low(rv={0.0 if rv is None else rv:.2f},min={REL_VOL_MIN})"
 
-    return True
+    return True, "ok"
 
-def fundamentals_pass(ticker: str) -> bool:
+def fundamentals_pass(ticker: str) -> Tuple[bool, str]:
     f = fetch_fundamentals_latest(ticker)
-    # If Polygon lacks fundamentals for the ticker, we conservatively fail
     eps = f["eps_yoy"]; rev = f["rev_yoy"]; roe = f["roe"]; de = f["de"]; peg = f["peg"]
 
-    if eps is None or rev is None or roe is None or de is None:
-        return False
-    if eps < EPS_GROWTH_MIN: return False
-    if rev < REV_GROWTH_MIN: return False
-    if roe < ROE_MIN: return False
-    if de > DE_MIN: return False
-    if peg is not None and peg > PEG_MAX: return False
-    return True
+    # Missing data reasons called out explicitly
+    if eps is None: return False, "fundamental:missing_eps_yoy"
+    if rev is None: return False, "fundamental:missing_rev_yoy"
+    if roe is None: return False, "fundamental:missing_roe"
+    if de  is None: return False, "fundamental:missing_de"
+
+    if eps < EPS_GROWTH_MIN: return False, f"fundamental:eps_yoy_low({eps:.3f}<{EPS_GROWTH_MIN})"
+    if rev < REV_GROWTH_MIN: return False, f"fundamental:rev_yoy_low({rev:.3f}<{REV_GROWTH_MIN})"
+    if roe < ROE_MIN:        return False, f"fundamental:roe_low({roe:.3f}<{ROE_MIN})"
+    if de > DE_MIN:          return False, f"fundamental:de_high({de:.3f}>{DE_MIN})"
+    if peg is not None and peg > PEG_MAX: return False, f"fundamental:peg_high({peg:.3f}>{PEG_MAX})"
+
+    return True, "ok"
 
 # -----------------------------
 # Universe & Buy
 # -----------------------------
 def get_candidate_universe() -> List[str]:
-    """
-    Build a reasonable, liquid US equities universe from Alpaca.
-    Applies some basic symbol filters to avoid OTC, ETFs by pattern, etc.
-    """
     assets = api.list_assets(status="active")
     cands = []
     for a in assets:
-        # Only US equities that are tradable
         if getattr(a, "class", None) != "us_equity":
             continue
         if not a.tradable:
             continue
         sym = a.symbol.upper()
-        # Simple symbol hygiene: exclude obvious ETFs/ETNs by suffixes or dashes, and very long symbols
         if "-" in sym or "/" in sym or len(sym) > 5:
             continue
         cands.append(sym)
 
-    # De-duplicate & cap
     uniq = sorted(set(cands))
     if len(uniq) > MAX_TICKERS_TO_CHECK:
         uniq = uniq[:MAX_TICKERS_TO_CHECK]
@@ -300,6 +278,8 @@ def submit_buy_notional(symbol: str, notional: float):
 # Main
 # -----------------------------
 def main():
+    session_start = time.time()
+
     log(f"Start | universe cap={MAX_TICKERS_TO_CHECK} | thresholds: "
         f"RSI[{RSI_MIN},{RSI_MAX}], RelVol≥{REL_VOL_MIN}, ≤10% from 52wH | "
         f"EPS YoY≥{EPS_GROWTH_MIN}, Rev YoY≥{REV_GROWTH_MIN}, ROE≥{ROE_MIN}, D/E≤{DE_MIN}, PEG≤{PEG_MAX}*"
@@ -316,52 +296,81 @@ def main():
     log(f"Buying power: ${buying_power:.2f}")
 
     buys_made = 0
+    reasons = Counter()
+    checked = 0
 
     for i, sym in enumerate(symbols, 1):
+        t0 = time.time()
         try:
-            # Fetch OHLCV
             df = fetch_daily_ohlcv(sym, days=300)
             if df is None or df.empty:
-                log(f"{i}/{len(symbols)} {sym}: no OHLCV; skip")
+                reasons["data:no_ohlcv"] += 1
+                vlog(f"{i}/{len(symbols)} {sym}: no OHLCV; skip")
                 continue
 
-            # Liquidity & price sanity
             last_close = float(df['close'].iloc[-1])
             if last_close < MIN_PRICE:
+                reasons["pre:price_low"] += 1
+                vlog(f"{i}/{len(symbols)} {sym}: price {last_close:.2f} < {MIN_PRICE}; skip")
                 continue
+
             adv = avg_dollar_volume_30d(df) or 0.0
             if adv < MIN_AVG_DOLLAR_VOL:
+                reasons["pre:liquidity_low"] += 1
+                vlog(f"{i}/{len(symbols)} {sym}: 30D $avg vol {adv:.0f} < {MIN_AVG_DOLLAR_VOL}; skip")
                 continue
 
-            # Technicals
-            if not technicals_pass(df):
+            ok_t, why_t = technicals_pass(df)
+            if not ok_t:
+                reasons[why_t] += 1
+                vlog(f"{i}/{len(symbols)} {sym}: {why_t}; skip")
                 continue
 
-            # Fundamentals
-            if not fundamentals_pass(sym):
+            ok_f, why_f = fundamentals_pass(sym)
+            if not ok_f:
+                reasons[why_f] += 1
+                vlog(f"{i}/{len(symbols)} {sym}: {why_f}; skip")
                 continue
 
-            # If it passes, buy 5% of *current* buying power
-            # Refresh buying power slightly to be conservative
+            # Refresh buying power conservatively
             try:
                 buying_power = float(api.get_account().buying_power)
             except Exception:
                 pass
+
             notional = buying_power * BUY_FRACTION_OF_BP
             if notional <= 0:
+                reasons["buy:no_buying_power"] += 1
                 log(f"{sym}: no buying power left; skipping")
                 continue
 
             submit_buy_notional(sym, notional)
             buys_made += 1
 
-            # small polite delay to avoid hammering APIs
-            time.sleep(0.25)
+            time.sleep(0.25)  # gentle rate limiting
 
         except Exception as e:
+            reasons[f"error:{type(e).__name__}"] += 1
             log(f"{sym}: error {type(e).__name__}: {e}")
+        finally:
+            checked += 1
+            if LOG_PROGRESS_EVERY > 0 and (i % LOG_PROGRESS_EVERY == 0):
+                elapsed = time.time() - session_start
+                log(f"Progress {i}/{len(symbols)} | buys={buys_made} | elapsed={elapsed:.1f}s")
 
-    log(f"Done. Buys placed: {buys_made}")
+            # Per-symbol timing (verbose only)
+            vlog(f"{sym}: processed in {(time.time()-t0):.3f}s")
+
+    elapsed = time.time() - session_start
+    log(f"Done. Symbols checked: {checked} | Buys placed: {buys_made} | Elapsed: {elapsed:.1f}s")
+
+    # Summary of reasons
+    if reasons:
+        log("Summary of skip reasons (top 15):")
+        for reason, cnt in reasons.most_common(15):
+            log(f"  - {reason}: {cnt}")
+    else:
+        log("No skip reasons recorded (unexpected).")
 
 if __name__ == "__main__":
     main()
